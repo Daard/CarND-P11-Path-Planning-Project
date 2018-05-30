@@ -8,11 +8,16 @@
 #include "Eigen-3.3/Eigen/Core"
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
+#include "spline.h"
 
 using namespace std;
 
 // for convenience
 using json = nlohmann::json;
+
+const double SAFE_DISTANCE = 30.0;
+const double MAX_SPEED = 49.5;
+const double MAX_ACC = 0.224;
 
 // For converting back and forth between radians and degrees.
 constexpr double pi() { return M_PI; }
@@ -74,13 +79,11 @@ int NextWaypoint(double x, double y, double theta, const vector<double> &maps_x,
 	double angle = fabs(theta-heading);
   angle = min(2*pi() - angle, angle);
 
-  if(angle > pi()/4)
-  {
+  if(angle > pi()/4){
     closestWaypoint++;
-  if (closestWaypoint == maps_x.size())
-  {
-    closestWaypoint = 0;
-  }
+    if (closestWaypoint == maps_x.size()){
+      closestWaypoint = 0;
+    }
   }
 
   return closestWaypoint;
@@ -200,7 +203,10 @@ int main() {
   	map_waypoints_dy.push_back(d_y);
   }
 
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
+  //Cencter lane
+  int lane = 1;
+  double speed = 0.0;
+  h.onMessage([&speed, &lane, &map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
                      uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
@@ -233,18 +239,166 @@ int main() {
           	// Previous path's end s and d values 
           	double end_path_s = j[1]["end_path_s"];
           	double end_path_d = j[1]["end_path_d"];
+            //Sensor fusion data
+            auto sensor_fusion = j[1]["sensor_fusion"];
 
-          	// Sensor Fusion Data, a list of all other cars on the same side of the road.
-          	auto sensor_fusion = j[1]["sensor_fusion"];
+            //get path size
+            int path_size = previous_path_x.size();
+            //avoid collision
+            if(path_size > 0){
+              car_s = end_path_s;
+            }
+
+            //PREDICTION STARTS
+            //Check position of sensored cars
+            bool sensored_left = false, sensored_right = false, sensored_ahead = false;
+            for (int i = 0; i < sensor_fusion.size(); i++){
+              float d = sensor_fusion[i][6];
+              int sensored_lane = -1;
+              //check sensored car lane
+              if( d > 0 && d < 4){
+                sensored_lane = 0;
+              }else if(d > 4 && d < 8){
+                sensored_lane = 1;
+              }else if(d > 8 && d < 12){
+                sensored_lane = 2;
+              }
+              if(sensored_lane < 0){
+                continue;
+              }
+              //get sensored car speed
+              double vx = sensor_fusion[i][3];
+              double vy = sensor_fusion[i][4];
+              double sensored_speed = sqrt(pow(vx, 2.0) + pow(vy, 2.0));
+              double sensored_s = sensor_fusion[i][5];
+              //Compute sensored car s coordinate
+              sensored_s += sensored_speed * 0.02 * path_size;
+              //is distance dangerous?
+              bool danger = fabs(car_s - sensored_s) < SAFE_DISTANCE;
+              int lane_delta = sensored_lane - lane;
+              if(lane_delta == -1){
+                //Sensored car is on left
+                sensored_left |= danger;
+              }else if (lane_delta == 1){
+                //Sensored car is on right
+                sensored_right |= danger;
+              }else if(lane_delta == 0){
+                sensored_ahead |= sensored_s > car_s && danger;
+              }
+            }
+            //PREDICTION ENDS
+
+            //BEHAVIOR PLANNING STARTS
+            double speed_delta = 0;
+            if(sensored_ahead){
+              //if there is car ahead ...
+              if(!sensored_left && lane > 0){
+                //but the left lane is free
+                //move left 
+                lane--;
+              }else if (!sensored_right && lane < 2){
+                //but the right lane is free
+                //move right
+                lane++;
+              }else{
+                //slow down if you are blocked
+                speed_delta -= MAX_ACC;
+              }
+            }else{
+              //move to center lane if you are not blocked
+              if(lane != 1){
+                if((lane == 0 && !sensored_right) || (lane == 2 && !sensored_left)){
+                  lane = 1;
+                }
+              }
+              if(speed < MAX_SPEED){
+                  speed_delta += MAX_ACC;
+              }
+            }
+            //BEHAVIOR PLANNING ENDS
+
+            //TRAJECTORY GENERATION STARTS
+            //get prev path points
+            vector<double> ptsx;
+            vector<double> ptsy;
+            double x = car_x;
+            double y = car_y;
+            double yaw = deg2rad(car_yaw);
+            //are there previous path points?
+            if(path_size < 2){
+              //calculate them
+              double prev_car_x = car_x - cos(car_yaw);
+              double prev_car_y = car_y - sin(car_yaw);
+              ptsx.push_back(prev_car_x);
+              ptsx.push_back(car_x);
+              ptsy.push_back(prev_car_y);
+              ptsy.push_back(car_y);
+            }else{
+              //get last two points
+              x = previous_path_x[path_size - 1];
+              y = previous_path_y[path_size - 1];
+              double prev_x = previous_path_x[path_size - 2];
+              double prev_y = previous_path_y[path_size - 2];
+              yaw = atan2(y - prev_y, x - prev_x);
+              ptsx.push_back(prev_x);
+              ptsx.push_back(x);
+              ptsy.push_back(prev_y);
+              ptsy.push_back(y);
+            }
+            //get next points
+            vector<double> next_p0 = getXY(car_s + 30, 2 + 4 * lane, 
+              map_waypoints_s, map_waypoints_x, map_waypoints_y);
+            vector<double> next_p1 = getXY(car_s + 60, 2 + 4 * lane, 
+              map_waypoints_s, map_waypoints_x, map_waypoints_y);
+            vector<double> next_p2 = getXY(car_s + 90, 2 + 4 * lane, 
+              map_waypoints_s, map_waypoints_x, map_waypoints_y);
+            //add to points next points
+            ptsx.push_back(next_p0[0]);
+            ptsx.push_back(next_p1[0]);
+            ptsx.push_back(next_p2[0]);
+            ptsy.push_back(next_p0[1]);
+            ptsy.push_back(next_p1[1]);
+            ptsy.push_back(next_p2[1]);
+            //Transform coordinates to car ones
+            for(int i = 0; i < ptsx.size(); i++){
+              double delta_x = ptsx[i] - x;
+              double delta_y = ptsy[i] - y;
+              ptsx[i] = delta_x * cos(yaw) + delta_y * sin(yaw);
+              ptsy[i] = - delta_x * sin(yaw) + delta_y * cos(yaw);
+            }
+            //create the spline
+            tk::spline s;
+            s.set_points(ptsx, ptsy);
+            //copy previous path
+            vector<double> next_x_vals;
+            vector<double> next_y_vals;
+            for (int i = 0; i < path_size; i++){
+              next_x_vals.push_back(previous_path_x[i]);
+              next_y_vals.push_back(previous_path_y[i]);
+            }
+            //Calculate next path
+            double step = SAFE_DISTANCE;
+            double step_distance = sqrt(pow(step, 2.0) + pow(s(step), 2.0));
+            double add = 0;
+            for(int i = 1; i < 50 - path_size; i++){
+              speed += speed_delta;
+              if(speed > MAX_SPEED){
+                speed = MAX_SPEED;
+              }else if (speed < MAX_ACC){
+                speed = MAX_ACC;
+              }
+              double N = step_distance / (0.02 * speed / 2.24);
+              double x_step = add + step / N;
+              double y_step = s(x_step);
+              add = x_step;
+              next_x_vals.push_back(x + x_step * cos(yaw) - y_step * sin(yaw));
+              next_y_vals.push_back(y + x_step * sin(yaw) + y_step * cos(yaw));
+            } 
+            //TRAJECTORY GENERATION ENDS
 
           	json msgJson;
 
-          	vector<double> next_x_vals;
-          	vector<double> next_y_vals;
-
-
-          	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
-          	msgJson["next_x"] = next_x_vals;
+            msgJson["next_x"] = next_x_vals;
           	msgJson["next_y"] = next_y_vals;
 
           	auto msg = "42[\"control\","+ msgJson.dump()+"]";
